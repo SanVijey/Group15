@@ -18,19 +18,32 @@ jobs:
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v7
+      uses: actions/checkout@v4
 
-    - name: Run Pipeline
+    - name: Run scheduled H&M pipeline
       env:
         SPARK_HOME: /opt/spark
         JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+        HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
+        DAT535_OUTPUT_DIR: /home/ubuntu/spark-lab-data/scheduled
+        SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[*]' }}
       run: |
-        # Activate the environment
         source ~/spark-env/bin/activate
-          
-        # Run the pipeline
-        echo "=== Starting Data Pipeline Execution ==="
-        python $GITHUB_WORKSPACE/run_pipeline.py all
+        test -d "$HM_DATASET_DIR" || { echo "::error::Dataset directory does not exist: $HM_DATASET_DIR"; exit 1; }
+        test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
+        mkdir -p "$DAT535_OUTPUT_DIR"
+        python -m py_compile "$GITHUB_WORKSPACE/hm_medallion_pipeline.py" "$GITHUB_WORKSPACE/run_pipeline.py"
+        python "$GITHUB_WORKSPACE/run_pipeline.py" hm \
+          --input-dir "$HM_DATASET_DIR" \
+          --output-dir "$DAT535_OUTPUT_DIR" \
+          --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          --master "$SPARK_MASTER_URL"
+        cat "$DAT535_OUTPUT_DIR/quality/github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_STEP_SUMMARY"
 
-        echo ""
-        echo "=== All Pipelines Completed Successfully ==="
+    - name: Upload scheduled outputs
+      uses: actions/upload-artifact@v4
+      with:
+        name: scheduled-outputs-${{ github.run_number }}
+        path: /home/ubuntu/spark-lab-data/scheduled/
+        retention-days: 30
+        if-no-files-found: error

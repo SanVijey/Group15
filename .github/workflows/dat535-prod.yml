@@ -5,12 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      lab:
-        description: Lab to run
+      run:
+        description: Run the H&M medallion pipeline
         required: true
-        default: all
+        default: hm
         type: choice
-        options: [all, lab2, lab3]
+        options: [hm]
 
 jobs:
   deploy-prod:
@@ -21,10 +21,12 @@ jobs:
       DAT535_ENV: prod
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
+      SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[*]' }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Resolve output directory
         id: output-dir
@@ -36,14 +38,18 @@ jobs:
           DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
           source ~/spark-env/bin/activate
+          test -d "$HM_DATASET_DIR" || { echo "::error::Dataset directory does not exist: $HM_DATASET_DIR"; exit 1; }
+          test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
           mkdir -p "$DAT535_OUTPUT_DIR"
-          
-          LAB_TO_RUN="${{ github.event.inputs.lab || 'all' }}"
-          echo "=== Running Production Pipeline ($LAB_TO_RUN) ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py $LAB_TO_RUN
+          python -m py_compile hm_medallion_pipeline.py run_pipeline.py
+          python "$GITHUB_WORKSPACE/run_pipeline.py" hm \
+            --input-dir "$HM_DATASET_DIR" \
+            --output-dir "$DAT535_OUTPUT_DIR" \
+            --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --master "$SPARK_MASTER_URL"
 
       - name: Upload Production artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: prod-outputs-${{ github.run_number }}
           path: ${{ steps.output-dir.outputs.dir }}/
@@ -56,6 +62,7 @@ jobs:
           echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Run # | ${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Lab | ${{ github.event.inputs.lab || 'all' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pipeline | H&M medallion |" >> $GITHUB_STEP_SUMMARY
           echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          cat "${{ steps.output-dir.outputs.dir }}/quality/github-${{ github.run_id }}-${{ github.run_attempt }}.json" >> "$GITHUB_STEP_SUMMARY"

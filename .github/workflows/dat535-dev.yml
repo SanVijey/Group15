@@ -16,28 +16,38 @@ jobs:
       DAT535_ENV: dev
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
+      SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[*]' }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Resolve output directory
         id: output-dir
         # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
         run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
 
-      - name: Run Lab 2 & Lab 3 Pipelines
+      - name: Validate pipeline source
+        run: |
+          test -d "$HM_DATASET_DIR" || { echo "::error::Dataset directory does not exist: $HM_DATASET_DIR"; exit 1; }
+          test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
+          python -m py_compile hm_medallion_pipeline.py run_pipeline.py
+
+      - name: Run H&M medallion pipeline
         env:
           DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
           source ~/spark-env/bin/activate
           mkdir -p "$DAT535_OUTPUT_DIR"
-          
-          echo "=== Running Dev Pipeline ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py all
+          python "$GITHUB_WORKSPACE/run_pipeline.py" hm \
+            --input-dir "$HM_DATASET_DIR" \
+            --output-dir "$DAT535_OUTPUT_DIR" \
+            --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --master "$SPARK_MASTER_URL"
 
       - name: Upload Dev artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: dev-outputs-${{ github.run_number }}
           path: ${{ steps.output-dir.outputs.dir }}/
