@@ -208,7 +208,14 @@ class HMMedallionPipeline:
             self._bronze_path("transactions")
         )
         parsed_transactions = raw_transactions.select(
-            "*",
+            "t_dat",
+            "customer_id",
+            "article_id",
+            "price",
+            "sales_channel_id",
+            "source_file",
+            "ingestion_timestamp",
+            "batch_id",
             F.to_date("t_dat").alias("transaction_date"),
             F.trim("customer_id").alias("clean_customer_id"),
             F.col("article_id").cast("long").alias("clean_article_id"),
@@ -234,17 +241,39 @@ class HMMedallionPipeline:
                 .when(F.col("clean_price").isNull() | (F.col("clean_price") <= 0), "invalid_price")
                 .otherwise("invalid_sales_channel_id"),
             )
+            .select(
+                "t_dat",
+                "customer_id",
+                "article_id",
+                "price",
+                "sales_channel_id",
+                "source_file",
+                "ingestion_timestamp",
+                "batch_id",
+                "transaction_date",
+                "rejection_reason",
+            )
         )
         quality_counts = parsed_transactions.select(
             F.count("*").alias("bronze_transactions"),
             F.sum(F.when(invalid, 1).otherwise(0)).alias("rejected_transactions"),
         ).first()
         rejected.write.mode("overwrite").parquet(str(self.output_dir / "silver" / "rejected_transactions"))
-        valid_rows = parsed_transactions.filter(~invalid)
-        valid = valid_rows.dropDuplicates(
-            ["t_dat", "customer_id", "article_id", "price", "sales_channel_id"]
+        valid_rows = parsed_transactions.filter(~invalid).select(
+            "t_dat",
+            "customer_id",
+            "article_id",
+            "price",
+            "sales_channel_id",
+            "transaction_date",
+            "clean_customer_id",
+            "clean_article_id",
+            "clean_price",
+            "clean_sales_channel_id",
         )
-        transactions = valid.select(
+        transactions = valid_rows.dropDuplicates(
+            ["t_dat", "customer_id", "article_id", "price", "sales_channel_id"]
+        ).select(
             "transaction_date",
             F.col("clean_customer_id").alias("customer_id"),
             F.col("clean_article_id").alias("article_id"),

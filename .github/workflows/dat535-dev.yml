@@ -28,8 +28,7 @@ jobs:
 
       - name: Resolve output directory
         id: output-dir
-        # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
-        run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
+        run: echo "dir=$HOME/spark-lab-data/dev/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Validate pipeline source
         run: |

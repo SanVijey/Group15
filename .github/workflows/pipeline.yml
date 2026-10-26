@@ -25,7 +25,7 @@ jobs:
         SPARK_HOME: /opt/spark
         JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
         HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
-        DAT535_OUTPUT_DIR: /home/ubuntu/spark-lab-data/scheduled
+        DAT535_OUTPUT_DIR: /home/ubuntu/spark-lab-data/scheduled/${{ github.run_id }}-${{ github.run_attempt }}
         SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[2]' }}
         SPARK_DRIVER_MEMORY: ${{ vars.SPARK_DRIVER_MEMORY || '3g' }}
         SPARK_EXECUTOR_MEMORY: ${{ vars.SPARK_EXECUTOR_MEMORY || '3g' }}
