@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -96,6 +97,12 @@ def _source_file_column(path: Path) -> F.Column:
     return F.coalesce(F.nullif(source_name, F.lit("")), F.lit(path.name))
 
 
+def _source_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    value = f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
 class HMMedallionPipeline:
     """Build H&M Bronze, Silver, and Gold datasets."""
 
@@ -119,8 +126,10 @@ class HMMedallionPipeline:
             SparkSession.builder.appName("DAT535-HM-Medallion")
             .config("spark.sql.adaptive.enabled", "true")
             .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-            .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "200"))
+            .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "400"))
             .config("spark.sql.parquet.compression.codec", "snappy")
+            .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "3g"))
+            .config("spark.executor.memory", os.environ.get("SPARK_EXECUTOR_MEMORY", "3g"))
         )
         if self.master:
             builder = builder.master(self.master)
@@ -162,10 +171,14 @@ class HMMedallionPipeline:
         bronze: Dict[str, DataFrame] = {}
 
         for table, (path, columns) in sources.items():
-            if self._batch_marker(table).exists():
-                LOGGER.info("Bronze %s: batch %s already ingested; skipping", table, self.batch_id)
-                bronze[table] = self.spark.read.parquet(self._bronze_path(table)).filter(
-                    F.col("batch_id") == self.batch_id
+            fingerprint = _source_fingerprint(path)
+            source_marker = self.output_dir / "bronze" / "_sources" / f"{table}-{fingerprint}.complete"
+            if source_marker.exists():
+                LOGGER.info("Bronze %s: unchanged source already ingested; skipping", table)
+                bronze[table] = self.spark.read.option("mergeSchema", "true").parquet(
+                    self._bronze_path(table)
+                ).filter(
+                    F.col("source_fingerprint") == fingerprint
                 )
                 continue
             frame = _read_as_strings(self.spark, path, columns)
@@ -175,11 +188,14 @@ class HMMedallionPipeline:
                 frame.withColumn("ingestion_timestamp", F.current_timestamp())
                 .withColumn("source_file", _source_file_column(path))
                 .withColumn("batch_id", F.lit(self.batch_id))
+                .withColumn("source_fingerprint", F.lit(fingerprint))
             )
             enriched.write.mode("append").parquet(self._bronze_path(table))
             marker = self._batch_marker(table)
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.touch()
+            source_marker.parent.mkdir(parents=True, exist_ok=True)
+            source_marker.touch()
             bronze[table] = enriched
             LOGGER.info("Bronze %s: %s rows appended from %s", table, enriched.count(), path)
         return bronze
@@ -188,7 +204,9 @@ class HMMedallionPipeline:
         if self.spark is None:
             raise RuntimeError("create_spark_session must be called first")
 
-        raw_transactions = self.spark.read.parquet(self._bronze_path("transactions"))
+        raw_transactions = self.spark.read.option("mergeSchema", "true").parquet(
+            self._bronze_path("transactions")
+        )
         parsed_transactions = raw_transactions.select(
             "*",
             F.to_date("t_dat").alias("transaction_date"),
@@ -217,6 +235,10 @@ class HMMedallionPipeline:
                 .otherwise("invalid_sales_channel_id"),
             )
         )
+        quality_counts = parsed_transactions.select(
+            F.count("*").alias("bronze_transactions"),
+            F.sum(F.when(invalid, 1).otherwise(0)).alias("rejected_transactions"),
+        ).first()
         rejected.write.mode("overwrite").parquet(str(self.output_dir / "silver" / "rejected_transactions"))
         valid_rows = parsed_transactions.filter(~invalid)
         valid = valid_rows.dropDuplicates(
@@ -229,7 +251,9 @@ class HMMedallionPipeline:
             F.col("clean_price").alias("price"),
             F.col("clean_sales_channel_id").alias("sales_channel_id"),
         )
-        articles = self.spark.read.parquet(self._bronze_path("articles")).select(
+        articles = self.spark.read.option("mergeSchema", "true").parquet(
+            self._bronze_path("articles")
+        ).select(
             F.col("article_id").cast("long").alias("article_id"),
             *[
                 F.coalesce(F.trim(F.col(column)), F.lit("UNKNOWN")).alias(column)
@@ -247,7 +271,9 @@ class HMMedallionPipeline:
                 )
             ],
         ).dropDuplicates(["article_id"])
-        customers = self.spark.read.parquet(self._bronze_path("customers")).select(
+        customers = self.spark.read.option("mergeSchema", "true").parquet(
+            self._bronze_path("customers")
+        ).select(
             F.trim("customer_id").alias("customer_id"),
             F.col("age").cast("double").alias("age"),
             F.coalesce(F.trim("club_member_status"), F.lit("UNKNOWN")).alias(
@@ -283,13 +309,20 @@ class HMMedallionPipeline:
         silver.write.mode("overwrite").partitionBy("transaction_date").parquet(
             self._silver_path("master_transactions")
         )
+        silver_count = self.spark.read.parquet(
+            self._silver_path("master_transactions")
+        ).count()
         metrics = {
             "batch_id": self.batch_id,
-            "bronze_transactions": raw_transactions.count(),
-            "rejected_transactions": rejected.count(),
-            "accepted_transactions": transactions.count(),
-            "silver_transactions": silver.count(),
-            "duplicate_transactions_removed": valid_rows.count() - valid.count(),
+            "bronze_transactions": quality_counts["bronze_transactions"],
+            "rejected_transactions": quality_counts["rejected_transactions"] or 0,
+            "accepted_transactions": silver_count,
+            "silver_transactions": silver_count,
+            "duplicate_transactions_removed": (
+                quality_counts["bronze_transactions"]
+                - quality_counts["rejected_transactions"]
+                - silver_count
+            ),
         }
         quality_path = self.output_dir / "quality"
         quality_path.mkdir(parents=True, exist_ok=True)
@@ -297,7 +330,9 @@ class HMMedallionPipeline:
             json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         LOGGER.info("Silver quality metrics: %s", metrics)
-        return silver
+        # Read the materialized layer back so Gold does not recompute the
+        # expensive validation and reference joins for every output.
+        return self.spark.read.parquet(self._silver_path("master_transactions"))
 
     def build_gold(self, silver: DataFrame) -> Dict[str, DataFrame]:
         if self.spark is None:
@@ -327,7 +362,9 @@ class HMMedallionPipeline:
                 F.max("transaction_date").alias("last_sale_date"),
             )
         )
-        all_articles = self.spark.read.parquet(self._bronze_path("articles")).select(
+        all_articles = self.spark.read.option("mergeSchema", "true").parquet(
+            self._bronze_path("articles")
+        ).select(
             F.col("article_id").cast("long").alias("article_id")
         ).distinct()
         inventory = (
@@ -375,7 +412,7 @@ class HMMedallionPipeline:
         }
         for name, frame in outputs.items():
             frame.write.mode("overwrite").parquet(self._gold_path(name))
-            LOGGER.info("Gold %s: %s rows", name, frame.count())
+            LOGGER.info("Gold %s written", name)
         return outputs
 
     def run(self) -> Dict[str, DataFrame]:

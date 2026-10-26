@@ -17,7 +17,10 @@ jobs:
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
       HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
-      SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[*]' }}
+      SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[2]' }}
+      SPARK_DRIVER_MEMORY: ${{ vars.SPARK_DRIVER_MEMORY || '3g' }}
+      SPARK_EXECUTOR_MEMORY: ${{ vars.SPARK_EXECUTOR_MEMORY || '3g' }}
+      SPARK_SHUFFLE_PARTITIONS: ${{ vars.SPARK_SHUFFLE_PARTITIONS || '200' }}
 
     steps:
       - name: Checkout code

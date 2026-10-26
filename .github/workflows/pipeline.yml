@@ -26,7 +26,10 @@ jobs:
         JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
         HM_DATASET_DIR: ${{ vars.HM_DATASET_DIR || '/home/ubuntu/HMDataSet' }}
         DAT535_OUTPUT_DIR: /home/ubuntu/spark-lab-data/scheduled
-        SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[*]' }}
+        SPARK_MASTER_URL: ${{ vars.SPARK_MASTER_URL || 'local[2]' }}
+        SPARK_DRIVER_MEMORY: ${{ vars.SPARK_DRIVER_MEMORY || '3g' }}
+        SPARK_EXECUTOR_MEMORY: ${{ vars.SPARK_EXECUTOR_MEMORY || '3g' }}
+        SPARK_SHUFFLE_PARTITIONS: ${{ vars.SPARK_SHUFFLE_PARTITIONS || '200' }}
       run: |
         source ~/spark-env/bin/activate
         test -d "$HM_DATASET_DIR" || { echo "::error::Dataset directory does not exist: $HM_DATASET_DIR"; exit 1; }

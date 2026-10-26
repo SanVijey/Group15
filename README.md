@@ -105,7 +105,7 @@ is local to the Spark machine. On the machine that has the dataset and Spark:
 4. If using a Spark standalone cluster, start the master and worker and create
    a repository variable named `SPARK_MASTER_URL`, for example
    `spark://spark-host:7077`. Without that variable, the workflow uses
-   `local[*]` on the runner.
+   `local[2]` on the runner to keep memory use bounded.
 5. If the dataset is elsewhere, create the repository variable
    `HM_DATASET_DIR` with the absolute path. Variables are configured under
    **Settings > Secrets and variables > Actions > Variables**.
