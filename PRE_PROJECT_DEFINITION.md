@@ -4,12 +4,12 @@
 ### 1. Project statement and scope
 
 We will build a batch PySpark pipeline that transforms
-H&M Fashion Transactions data into trusted, reusable datasets for retail
+H&M Fashion Transactions data into reusable datasets for retail
 analysis. The business need is to understand customer purchasing preferences,
 identify high-velocity and slow-moving products, and provide reliable inputs
 for recommendation analysis and merchandising dashboards.
 
-The outcome is a repeatable Medallion Architecture pipeline that
+The outcome is a Medallion Architecture pipeline that
 produces:
 
 - a traceable Bronze copy of the source data
@@ -26,8 +26,8 @@ The project uses the H&M Personalized Fashion Recommendations dataset,
 consisting of `transactions_train`, `articles`, and `customers` source files.
 The files are available as CSV or Parquet; the pipeline supports both. The
 transaction history contains more than 31 million records, while the article
-and customer files provide product and customer reference data. This volume,
-the transaction structure, and the required distributed joins
+and customer files provide product and customer reference data. The volume,
+transaction structure, and the required distributed joins
 make the dataset suitable for Spark processing.
 
 Transactions describe a customer purchase, including date, customer ID,
@@ -69,7 +69,7 @@ hard-coded source data in Git.
 
 Silver is the primary focus. Its core grain is one accepted H&M transaction:
 one purchase identified by transaction date, customer, article, price, and
-sales channel. The transaction table is the fact-like core, enriched with
+sales channel. The transaction table is the fact-like core, filled with
 deduplicated article and customer reference records. Silver will retain
 transaction-level detail so it can support several downstream analyses rather
 than only one dashboard.
@@ -79,7 +79,7 @@ The transformation design is:
 1. Parse the transaction date and cast article IDs, sales channels, customer
    attributes, and prices to explicit types.
 2. Trim identifiers and text fields and standardize missing descriptive
-   attributes to an explicit `UNKNOWN` value.
+   attributes to an `UNKNOWN` value.
 3. Validate dates, customer IDs, article IDs, positive prices, and supported
    sales-channel values.
 4. Remove exact duplicate transaction records.
@@ -100,7 +100,7 @@ after these transformations and checks complete successfully.
 
 The implementation will use Spark DataFrame functions for parsing, filtering,
 deduplication, joins, and aggregations, with Spark SQL-compatible expressions
-where they improve clarity. Expensive joins and aggregations will be profiled
+where they improve clarity. Expensive joins and aggregations will be done
 using Spark stage and task metrics. Evidence-based tuning may include early
 filtering, selecting only required columns, date partitioning, adaptive query
 execution, appropriate shuffle partitions, and broadcasting only genuinely
@@ -127,11 +127,11 @@ recommendation experiments?
 The planned outputs are:
 
 - `customer_segment_preferences`: top garment-group and colour preferences by
-  age group, including units, distinct customers, and distinct articles;
+  age group, including units, distinct customers, and distinct articles
 - `inventory_velocity`: units sold, sales days, last sale date, recent
-  activity, and a dead-stock indicator by article;
+  activity, and a dead-stock indicator by article
 - `recommendation_features`: customer/article interaction counts, spend, and
-  most recent purchase date;
+  most recent purchase date
 - `daily_sales_demand`: daily transaction count, unique customers, total sales,
   and average price.
 
@@ -157,9 +157,3 @@ batch ID, row counts, rejected records, and quality results. A failed input
 check, Spark job, transformation, or quality gate will fail the workflow
 instead of producing a success-shaped result.
 
-The data engineering team owns the pipeline code, quality rules, workflow
-configuration, and operational documentation. Future improvements may include
-incremental period-level processing, a table format with stronger transaction
-semantics, data-quality alerting, schema contracts, and a production
-recommendation model. These improvements are deliberately deferred until the
-repeatable batch pipeline and its quality evidence are stable.
