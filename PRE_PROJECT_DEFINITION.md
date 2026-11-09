@@ -52,10 +52,11 @@ bronze/customers
 ```
 
 Every row will receive `source_file`, `ingestion_timestamp`, and `batch_id`.
-The original source values will not be cleaned or joined in Bronze. A stable
-batch identifier and completion marker will prevent accidental duplicate
-ingestion when a workflow is retried. New batches append to the raw history,
-allowing later replay and audit. Source discovery and required-file checks will
+The original source values will not be cleaned or joined in Bronze. Content
+SHA-256 identifiers and staged directory commits prevent accidental duplicate
+ingestion on retry; original files are also archived unchanged. Sample limits
+are fixed per output root. Changed transaction snapshots require a fresh root
+because they may overlap previously ingested history. Source discovery and required-file checks will
 fail the run explicitly when inputs are missing.
 
 GitHub Actions will validate the Python source and execute the ingestion on a
@@ -68,8 +69,9 @@ hard-coded source data in Git.
 ### 4. Silver layer: standardize, validate, and enrich
 
 Silver is the primary focus. Its core grain is one accepted H&M transaction:
-one purchase identified by transaction date, customer, article, price, and
-sales channel. The transaction table is the fact-like core, filled with
+one observed purchase described by transaction date, customer, article, price,
+and sales channel. These fields are not a guaranteed unique purchase ID, so
+identical observations are preserved. The transaction table is the fact-like core, filled with
 deduplicated article and customer reference records. Silver will retain
 transaction-level detail so it can support several downstream analyses rather
 than only one dashboard.
@@ -82,9 +84,10 @@ The transformation design is:
    attributes to an `UNKNOWN` value.
 3. Validate dates, customer IDs, article IDs, positive prices, and supported
    sales-channel values.
-4. Remove exact duplicate transaction records.
-5. Deduplicate reference records before joining them to transactions, avoiding
-   accidental row multiplication.
+4. Preserve transaction multiplicity; duplicate source ingestion is prevented
+   in Bronze rather than assuming identical purchases are duplicates.
+5. Deduplicate identical reference records, reject conflicts within one source
+   version and select the latest ingested version per key before joining.
 6. Derive reusable attributes such as `age_group` and calendar fields.
 7. Write accepted records as date-partitioned Parquet in
    `silver/master_transactions`.
@@ -93,7 +96,7 @@ The transformation design is:
 
 Quality evidence will be generated for every run. It will compare Bronze input
 with accepted and rejected records and record the number of exact duplicates
-removed. Required checks include schema availability, accepted-row counts,
+removed (zero under the preserve-purchases policy). Required checks include schema availability, accepted-row counts,
 rejected-row counts, duplicate counts, non-null key fields, positive prices,
 valid dates, and valid sales channels. Silver outputs should be published only
 after these transformations and checks complete successfully.
@@ -109,8 +112,9 @@ effect.
 
 The design scales by processing Parquet rather than repeatedly scanning raw
 CSV, partitioning Silver by transaction date, and allowing later batches to be
-identified independently. Late-arriving data can be rerun by batch and Silver
-can be rebuilt from Bronze. If source schemas evolve, the ingestion schema and
+identified independently. Incremental late-arrival handling is future work;
+updated transaction snapshots use a fresh output root. Silver can be rebuilt
+from Bronze. If source schemas evolve, the ingestion schema and
 validation rules will be versioned and changed through review. Tests and
 GitHub Actions checks will validate transformations and schemas before
 deployment.
@@ -150,10 +154,9 @@ separate output locations and GitHub Actions environments. The repository
 contains the pipeline source, workflow files, configuration conventions, and
 run instructions; source data and credentials remain outside version control.
 
-Automated checks will compile the Python source, verify required inputs,
+Automated checks compile the Python source, run synthetic regression tests, verify required inputs,
 execute the pipeline, and upload Bronze, Silver, Gold, rejected records, and
 quality metrics as workflow artifacts. Logs will show the Spark environment,
 batch ID, row counts, rejected records, and quality results. A failed input
 check, Spark job, transformation, or quality gate will fail the workflow
 instead of producing a success-shaped result.
-

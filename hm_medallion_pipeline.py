@@ -5,14 +5,18 @@ The pipeline accepts either the CSV files from the Kaggle download or the
 Parquet conversion currently present on the Spark VM. Bronze writes are
 append-only; Silver and Gold are rebuilt from the complete Bronze history.
 """
-#freddy fazbear
 from __future__ import annotations
 
 import argparse
+import csv
+import fcntl
 import json
 import logging
 import os
 import hashlib
+import shutil
+import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -27,6 +31,7 @@ except ImportError:
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from py4j.protocol import Py4JError
 
 LOGGER = logging.getLogger("hm_medallion_pipeline")
 
@@ -72,14 +77,22 @@ CUSTOMER_COLUMNS = [
 def _read_as_strings(spark: SparkSession, path: Path, columns: list[str]) -> DataFrame:
     """Read one source file while preserving raw values for Bronze."""
     if path.suffix.lower() == ".csv":
+        with path.open(newline="", encoding="utf-8-sig") as source:
+            header = next(csv.reader(source), [])
+        if header != columns:
+            raise ValueError(f"Unexpected CSV schema in {path}: {header}")
         frame = (
             spark.read.option("header", True)
-            .option("mode", "PERMISSIVE")
-            .schema("`" + "`,`".join(f"{column}` STRING" for column in columns))
+            .option("mode", "FAILFAST")
+            .option("multiLine", True)
+            .option("escape", '"')
+            .schema(", ".join(f"`{column}` STRING" for column in columns))
             .csv(str(path))
         )
     else:
         frame = spark.read.parquet(str(path))
+        if set(frame.columns) != set(columns):
+            raise ValueError(f"Unexpected Parquet schema in {path}: {frame.columns}")
         frame = frame.select(
             [F.col(column).cast("string").alias(column) for column in columns]
         )
@@ -98,9 +111,15 @@ def _source_file_column(path: Path) -> F.Column:
 
 
 def _source_fingerprint(path: Path) -> str:
-    stat = path.stat()
-    value = f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _clean_text(column: str) -> F.Column:
+    return F.coalesce(F.nullif(F.trim(F.col(column)), F.lit("")), F.lit("UNKNOWN"))
 
 
 class HMMedallionPipeline:
@@ -118,6 +137,10 @@ class HMMedallionPipeline:
         self.output_dir = Path(output_dir).expanduser()
         self.batch_id = batch_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.limit_rows = limit_rows
+        if limit_rows is not None and limit_rows <= 0:
+            raise ValueError("limit_rows must be positive")
+        if not self.batch_id or Path(self.batch_id).name != self.batch_id or self.batch_id in (".", ".."):
+            raise ValueError("batch_id must be a non-empty filename component")
         self.master = master
         self.spark: Optional[SparkSession] = None
 
@@ -156,8 +179,31 @@ class HMMedallionPipeline:
     def _gold_path(self, table: str) -> str:
         return str(self.output_dir / "gold" / table)
 
-    def _batch_marker(self, table: str) -> Path:
-        return self.output_dir / "bronze" / "_batches" / f"{table}-{self.batch_id}.complete"
+    def _write_quality(self, metrics: dict[str, object]) -> None:
+        quality_path = self.output_dir / "quality"
+        quality_path.mkdir(parents=True, exist_ok=True)
+        destination = quality_path / f"{self.batch_id}.json"
+        temporary = destination.with_suffix(".partial")
+        temporary.write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary.replace(destination)
+
+    def _latest_reference(self, table: str, key: str, columns: list[str]) -> DataFrame:
+        if self.spark is None:
+            raise RuntimeError("create_spark_session must be called first")
+        raw = self.spark.read.parquet(self._bronze_path(table))
+        normal_key = (
+            F.expr("try_cast(article_id AS BIGINT)") if key == "article_id"
+            else F.trim(F.col(key))
+        )
+        versions = raw.withColumn(key, normal_key).dropDuplicates(columns + ["source_fingerprint"])
+        if versions.groupBy(key, "source_fingerprint").count().filter("count > 1").limit(1).count():
+            raise ValueError(f"Conflicting {table} records within a source version")
+        window = Window.partitionBy(key).orderBy(
+            F.desc("ingestion_timestamp"), F.desc("source_fingerprint")
+        )
+        return versions.withColumn("_version_rank", F.row_number().over(window)).filter("_version_rank = 1")
 
     def ingest_bronze(self) -> Dict[str, DataFrame]:
         if self.spark is None:
@@ -169,19 +215,41 @@ class HMMedallionPipeline:
             "customers": (self._find_source("customers"), CUSTOMER_COLUMNS),
         }
         bronze: Dict[str, DataFrame] = {}
+        config_path = self.output_dir / "_ingestion_config.json"
+        config = {"version": 2, "limit_rows": self.limit_rows}
+        if config_path.exists():
+            if json.loads(config_path.read_text()) != config:
+                raise ValueError("Do not mix different sample limits or full runs in one output directory")
+        else:
+            if (self.output_dir / "bronze").exists():
+                raise ValueError("Legacy Bronze layout detected; use a fresh output directory")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
 
         for table, (path, columns) in sources.items():
             fingerprint = _source_fingerprint(path)
-            source_marker = self.output_dir / "bronze" / "_sources" / f"{table}-{fingerprint}.complete"
-            if source_marker.exists():
+            destination = Path(self._bronze_path(table)) / f"source_version={fingerprint}"
+            if (destination / "_SUCCESS").exists():
                 LOGGER.info("Bronze %s: unchanged source already ingested; skipping", table)
-                bronze[table] = self.spark.read.option("mergeSchema", "true").parquet(
-                    self._bronze_path(table)
-                ).filter(
-                    F.col("source_fingerprint") == fingerprint
-                )
+                bronze[table] = self.spark.read.parquet(str(destination))
                 continue
-            frame = _read_as_strings(self.spark, path, columns)
+            if table == "transactions" and destination.parent.exists():
+                if any(destination.parent.glob("source_version=*/_SUCCESS")):
+                    raise ValueError(
+                        "Changed transaction snapshot detected; use a fresh output directory "
+                        "to avoid double-counting overlapping historical purchases"
+                    )
+            archive = self.output_dir / "raw" / table / fingerprint / path.name
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            if not archive.exists():
+                temporary = archive.with_suffix(archive.suffix + ".partial")
+                shutil.copyfile(path, temporary)
+                if _source_fingerprint(temporary) != fingerprint:
+                    raise ValueError(f"Source changed while archiving: {path}")
+                temporary.replace(archive)
+            elif _source_fingerprint(archive) != fingerprint:
+                raise ValueError(f"Archived source checksum mismatch: {archive}")
+            frame = _read_as_strings(self.spark, archive, columns)
             if self.limit_rows is not None:
                 frame = frame.limit(self.limit_rows)
             enriched = (
@@ -190,14 +258,12 @@ class HMMedallionPipeline:
                 .withColumn("batch_id", F.lit(self.batch_id))
                 .withColumn("source_fingerprint", F.lit(fingerprint))
             )
-            enriched.write.mode("append").parquet(self._bronze_path(table))
-            marker = self._batch_marker(table)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.touch()
-            source_marker.parent.mkdir(parents=True, exist_ok=True)
-            source_marker.touch()
-            bronze[table] = enriched
-            LOGGER.info("Bronze %s: %s rows appended from %s", table, enriched.count(), path)
+            staging = self.output_dir / "_staging" / f"{table}-{uuid.uuid4().hex}"
+            enriched.write.mode("errorifexists").parquet(str(staging))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staging.rename(destination)
+            bronze[table] = self.spark.read.parquet(str(destination))
+            LOGGER.info("Bronze %s committed from %s (sha256=%s)", table, path, fingerprint)
         return bronze
 
     def build_silver(self) -> DataFrame:
@@ -216,19 +282,21 @@ class HMMedallionPipeline:
             "source_file",
             "ingestion_timestamp",
             "batch_id",
-            F.to_date("t_dat").alias("transaction_date"),
+            F.expr("try_cast(t_dat AS DATE)").alias("transaction_date"),
             F.trim("customer_id").alias("clean_customer_id"),
-            F.col("article_id").cast("long").alias("clean_article_id"),
-            F.col("price").cast("decimal(12, 4)").alias("clean_price"),
-            F.col("sales_channel_id").cast("int").alias("clean_sales_channel_id"),
+            F.expr("try_cast(article_id AS BIGINT)").alias("clean_article_id"),
+            F.expr("try_cast(price AS DECIMAL(12, 4))").alias("clean_price"),
+            F.expr("try_cast(sales_channel_id AS INT)").alias("clean_sales_channel_id"),
         )
         invalid = (
             F.col("transaction_date").isNull()
             | F.col("clean_customer_id").isNull()
             | (F.col("clean_customer_id") == "")
             | F.col("clean_article_id").isNull()
+            | (F.col("clean_article_id") <= 0)
             | F.col("clean_price").isNull()
             | (F.col("clean_price") <= 0)
+            | F.col("clean_sales_channel_id").isNull()
             | ~F.col("clean_sales_channel_id").isin(1, 2)
         )
         rejected = (
@@ -237,7 +305,7 @@ class HMMedallionPipeline:
                 "rejection_reason",
                 F.when(F.col("transaction_date").isNull(), "invalid_date")
                 .when(F.col("clean_customer_id").isNull() | (F.col("clean_customer_id") == ""), "missing_customer_id")
-                .when(F.col("clean_article_id").isNull(), "invalid_article_id")
+                .when(F.col("clean_article_id").isNull() | (F.col("clean_article_id") <= 0), "invalid_article_id")
                 .when(F.col("clean_price").isNull() | (F.col("clean_price") <= 0), "invalid_price")
                 .otherwise("invalid_sales_channel_id"),
             )
@@ -259,33 +327,35 @@ class HMMedallionPipeline:
             F.sum(F.when(invalid, 1).otherwise(0)).alias("rejected_transactions"),
         ).first()
         rejected.write.mode("overwrite").parquet(str(self.output_dir / "silver" / "rejected_transactions"))
-        valid_rows = parsed_transactions.filter(~invalid).select(
-            "t_dat",
-            "customer_id",
-            "article_id",
-            "price",
-            "sales_channel_id",
+        if quality_counts["bronze_transactions"] == (quality_counts["rejected_transactions"] or 0):
+            self._write_quality({
+                "batch_id": self.batch_id,
+                "bronze_transactions": quality_counts["bronze_transactions"],
+                "rejected_transactions": quality_counts["rejected_transactions"] or 0,
+                "accepted_transactions": 0,
+                "silver_transactions": 0,
+                "duplicate_transactions_removed": 0,
+                "quality_passed": False,
+            })
+            raise ValueError("Silver non-empty quality gate failed: no valid transactions")
+        valid_rows = parsed_transactions.filter(~invalid)
+        # There is no unique purchase ID: identical observations may be real purchases.
+        transactions = valid_rows.select(
             "transaction_date",
-            "clean_customer_id",
-            "clean_article_id",
-            "clean_price",
-            "clean_sales_channel_id",
-        )
-        transactions = valid_rows.dropDuplicates(
-            ["t_dat", "customer_id", "article_id", "price", "sales_channel_id"]
-        ).select(
-            "transaction_date",
+            "source_file",
+            "ingestion_timestamp",
+            "batch_id",
             F.col("clean_customer_id").alias("customer_id"),
             F.col("clean_article_id").alias("article_id"),
             F.col("clean_price").alias("price"),
             F.col("clean_sales_channel_id").alias("sales_channel_id"),
+        ).withColumn("transaction_year", F.year("transaction_date")).withColumn(
+            "transaction_month", F.month("transaction_date")
         )
-        articles = self.spark.read.option("mergeSchema", "true").parquet(
-            self._bronze_path("articles")
-        ).select(
-            F.col("article_id").cast("long").alias("article_id"),
+        articles = self._latest_reference("articles", "article_id", ARTICLE_COLUMNS).select(
+            F.expr("try_cast(article_id AS BIGINT)").alias("article_id"),
             *[
-                F.coalesce(F.trim(F.col(column)), F.lit("UNKNOWN")).alias(column)
+                _clean_text(column).alias(column)
                 for column in (
                     "prod_name",
                     "product_type_name",
@@ -299,22 +369,31 @@ class HMMedallionPipeline:
                     "detail_desc",
                 )
             ],
-        ).dropDuplicates(["article_id"])
-        customers = self.spark.read.option("mergeSchema", "true").parquet(
-            self._bronze_path("customers")
-        ).select(
+        )
+        # Conflicting reference records within a source cannot be resolved safely.
+        if articles.groupBy("article_id").count().filter("count > 1 OR article_id IS NULL OR article_id <= 0").limit(1).count():
+            raise ValueError("Invalid or conflicting article reference keys")
+        customers = self._latest_reference("customers", "customer_id", CUSTOMER_COLUMNS).select(
             F.trim("customer_id").alias("customer_id"),
-            F.col("age").cast("double").alias("age"),
-            F.coalesce(F.trim("club_member_status"), F.lit("UNKNOWN")).alias(
+            F.expr("try_cast(age AS DOUBLE)").alias("age"),
+            _clean_text("club_member_status").alias(
                 "club_member_status"
             ),
-            F.coalesce(F.trim("fashion_news_frequency"), F.lit("UNKNOWN")).alias(
+            _clean_text("fashion_news_frequency").alias(
                 "fashion_news_frequency"
             ),
-            F.coalesce(F.trim("postal_code"), F.lit("UNKNOWN")).alias("postal_code"),
-        ).dropDuplicates(["customer_id"])
+            _clean_text("postal_code").alias("postal_code"),
+        )
+        if customers.groupBy("customer_id").count().filter("count > 1 OR customer_id IS NULL OR customer_id = ''").limit(1).count():
+            raise ValueError("Invalid or conflicting customer reference keys")
 
         customer_clean = customers.withColumn(
+            "age",
+            F.when(
+                F.col("age").between(0, 120) & ~F.isnan("age") & (F.col("age") == F.floor("age")),
+                F.col("age").cast("int"),
+            ),
+        ).withColumn(
             "age_group",
             F.when(F.col("age").isNull(), "UNKNOWN")
             .when(F.col("age") < 20, "UNDER_20")
@@ -326,42 +405,63 @@ class HMMedallionPipeline:
         )
 
         silver = (
-            transactions.join(articles, "article_id", "left")
-            .join(customer_clean, "customer_id", "left")
-            .withColumn("transaction_date", F.coalesce(F.col("transaction_date"), F.to_date(F.lit("1900-01-01"))))
-            .withColumn("price", F.coalesce(F.col("price"), F.lit(0).cast("decimal(12,4)")))
+            transactions.join(articles.withColumn("article_matched", F.lit(True)), "article_id", "left")
+            .join(customer_clean.withColumn("customer_matched", F.lit(True)), "customer_id", "left")
+            .fillna(False, subset=["article_matched", "customer_matched"])
             .withColumn("age_group", F.coalesce(F.col("age_group"), F.lit("UNKNOWN")))
             .withColumn("product_group_name", F.coalesce(F.col("product_group_name"), F.lit("UNKNOWN")))
             .withColumn("colour_group_name", F.coalesce(F.col("colour_group_name"), F.lit("UNKNOWN")))
             .withColumn("garment_group_name", F.coalesce(F.col("garment_group_name"), F.lit("UNKNOWN")))
         )
+        for column in articles.columns + customer_clean.columns:
+            if column not in ("article_id", "customer_id", "age", "age_group"):
+                silver = silver.withColumn(column, _clean_text(column))
         silver.write.mode("overwrite").partitionBy("transaction_date").parquet(
             self._silver_path("master_transactions")
         )
-        silver_count = self.spark.read.parquet(
+        materialized = self.spark.read.parquet(
             self._silver_path("master_transactions")
-        ).count()
+        )
+        summary = materialized.agg(
+            F.count("*").alias("count"),
+            F.sum(F.when(
+                F.col("transaction_date").isNull()
+                | F.col("customer_id").isNull() | (F.col("customer_id") == "")
+                | F.col("article_id").isNull() | (F.col("article_id") <= 0)
+                | F.col("price").isNull() | (F.col("price") <= 0)
+                | F.col("sales_channel_id").isNull() | ~F.col("sales_channel_id").isin(1, 2),
+                1,
+            ).otherwise(0)).alias("invalid_silver_rows"),
+            F.sum(F.when(~F.col("article_matched"), 1).otherwise(0)).alias("unmatched_articles"),
+            F.sum(F.when(~F.col("customer_matched"), 1).otherwise(0)).alias("unmatched_customers"),
+        ).first()
+        silver_count = summary["count"]
+        rejected_count = rejected.count()
         metrics = {
             "batch_id": self.batch_id,
             "bronze_transactions": quality_counts["bronze_transactions"],
             "rejected_transactions": quality_counts["rejected_transactions"] or 0,
             "accepted_transactions": silver_count,
             "silver_transactions": silver_count,
-            "duplicate_transactions_removed": (
-                quality_counts["bronze_transactions"]
-                - quality_counts["rejected_transactions"]
-                - silver_count
+            "duplicate_transactions_removed": 0,
+            "deduplication_policy": "preserve_purchase_multiplicity",
+            "invalid_silver_rows": summary["invalid_silver_rows"] or 0,
+            "unmatched_article_transactions": summary["unmatched_articles"] or 0,
+            "unmatched_customer_transactions": summary["unmatched_customers"] or 0,
+            "quality_passed": (
+                silver_count > 0
+                and summary["invalid_silver_rows"] == 0
+                and quality_counts["bronze_transactions"] == rejected_count + silver_count
+                and rejected_count == (quality_counts["rejected_transactions"] or 0)
             ),
         }
-        quality_path = self.output_dir / "quality"
-        quality_path.mkdir(parents=True, exist_ok=True)
-        (quality_path / f"{self.batch_id}.json").write_text(
-            json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        self._write_quality(metrics)
         LOGGER.info("Silver quality metrics: %s", metrics)
+        if not metrics["quality_passed"]:
+            raise ValueError(f"Silver row-accounting or non-empty quality gate failed: {metrics}")
         # Read the materialized layer back so Gold does not recompute the
         # expensive validation and reference joins for every output.
-        return self.spark.read.parquet(self._silver_path("master_transactions"))
+        return materialized
 
     def build_gold(self, silver: DataFrame) -> Dict[str, DataFrame]:
         if self.spark is None:
@@ -382,6 +482,11 @@ class HMMedallionPipeline:
         )
 
         max_date = silver.agg(F.max("transaction_date").alias("max_date")).first()["max_date"]
+        if max_date is None:
+            raise ValueError("Cannot publish Gold from empty Silver")
+        recent = F.col("transaction_date").between(
+            F.date_sub(F.lit(max_date), 29), F.lit(max_date)
+        )
         inventory_metrics = (
             silver.groupBy("article_id")
             .agg(
@@ -389,12 +494,15 @@ class HMMedallionPipeline:
                 F.countDistinct("customer_id").alias("unique_customers"),
                 F.countDistinct("transaction_date").alias("sales_days"),
                 F.max("transaction_date").alias("last_sale_date"),
+                F.sum(F.when(recent, 1).otherwise(0)).alias("recent_units_30d"),
             )
         )
         all_articles = self.spark.read.option("mergeSchema", "true").parquet(
             self._bronze_path("articles")
         ).select(
             F.col("article_id").cast("long").alias("article_id")
+        ).filter("article_id IS NOT NULL AND article_id > 0").union(
+            silver.select("article_id").distinct()
         ).distinct()
         inventory = (
             all_articles.join(inventory_metrics, "article_id", "left")
@@ -404,10 +512,7 @@ class HMMedallionPipeline:
             .withColumn("dataset_max_date", F.lit(max_date).cast("date"))
             .withColumn(
                 "recent_units_30d",
-                F.when(
-                    F.col("last_sale_date") >= F.date_sub(F.col("dataset_max_date"), 29),
-                    F.col("total_units_sold"),
-                ).otherwise(F.lit(0)),
+                F.coalesce(F.col("recent_units_30d"), F.lit(0)),
             )
             .withColumn(
                 "deadstock_last_30d",
@@ -416,7 +521,7 @@ class HMMedallionPipeline:
         )
 
         recommendation_window = Window.partitionBy("customer_id").orderBy(
-            F.desc("interaction_count"), F.desc("last_purchase_date")
+            F.desc("interaction_count"), F.desc("last_purchase_date"), F.asc("article_id")
         )
         recommendations = (
             silver.groupBy("customer_id", "article_id")
@@ -442,17 +547,51 @@ class HMMedallionPipeline:
         for name, frame in outputs.items():
             frame.write.mode("overwrite").parquet(self._gold_path(name))
             LOGGER.info("Gold %s written", name)
+        expected = silver.agg(F.count("*").alias("units"), F.sum("price").alias("sales")).first()
+        for name, units, sales in (
+            ("daily_sales_demand", "transaction_count", "total_sales"),
+            ("recommendation_features", "interaction_count", "total_spend"),
+            ("inventory_velocity", "total_units_sold", None),
+        ):
+            written = self.spark.read.parquet(self._gold_path(name))
+            actual = written.agg(
+                F.sum(units).alias("units"),
+                F.sum(sales).alias("sales") if sales else F.lit(None).alias("sales"),
+            ).first()
+            if actual["units"] != expected["units"] or (sales and actual["sales"] != expected["sales"]):
+                raise ValueError(f"Gold reconciliation failed for {name}: {actual} != {expected}")
         return outputs
 
     def run(self) -> Dict[str, DataFrame]:
-        self.create_spark_session()
-        try:
-            self.ingest_bronze()
-            silver = self.build_silver()
-            return self.build_gold(silver)
-        finally:
-            assert self.spark is not None
-            self.spark.stop()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "_run.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ready = self.output_dir / "_READY.json"
+            ready.unlink(missing_ok=True)
+            self.create_spark_session()
+            try:
+                self.ingest_bronze()
+                silver = self.build_silver()
+                outputs = self.build_gold(silver)
+                temporary = ready.with_suffix(".partial")
+                temporary.write_text(json.dumps({
+                    "batch_id": self.batch_id,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "gold_tables": list(outputs),
+                    "quality_report": f"quality/{self.batch_id}.json",
+                }, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(ready)
+                return outputs
+            finally:
+                failed = sys.exc_info()[0] is not None
+                assert self.spark is not None
+                try:
+                    self.spark.stop()
+                except (Py4JError, ConnectionError):
+                    if not failed:
+                        ready.unlink(missing_ok=True)
+                        raise
+                    LOGGER.exception("Spark shutdown failed after pipeline failure; preserving original error")
 
 
 def parse_args() -> argparse.Namespace:

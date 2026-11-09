@@ -11,6 +11,10 @@ on:
     #- cron: '0 */6 * * *'  # every 6 hours
     - cron: '0 0 1 * *'     # active: monthly, 1st of month at 00:00 UTC
 
+concurrency:
+  group: group15-spark-runner
+  cancel-in-progress: false
+
 jobs:
   run-pipeline:
     name: Run PySpark Pipeline
@@ -36,17 +40,21 @@ jobs:
         test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
         mkdir -p "$DAT535_OUTPUT_DIR"
         python -m py_compile "$GITHUB_WORKSPACE/hm_medallion_pipeline.py" "$GITHUB_WORKSPACE/run_pipeline.py"
+        SPARK_DRIVER_MEMORY=512m SPARK_EXECUTOR_MEMORY=512m SPARK_SHUFFLE_PARTITIONS=2 \
+          PYSPARK_SUBMIT_ARGS='--driver-memory 512m pyspark-shell' \
+          python -m unittest discover -s tests -v
         python "$GITHUB_WORKSPACE/run_pipeline.py" hm \
           --input-dir "$HM_DATASET_DIR" \
           --output-dir "$DAT535_OUTPUT_DIR" \
           --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
           --master "$SPARK_MASTER_URL"
+        test -f "$DAT535_OUTPUT_DIR/_READY.json"
         cat "$DAT535_OUTPUT_DIR/quality/github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Upload scheduled outputs
       uses: actions/upload-artifact@v4
       with:
         name: scheduled-outputs-${{ github.run_number }}
-        path: /home/ubuntu/spark-lab-data/scheduled/
+        path: /home/ubuntu/spark-lab-data/scheduled/${{ github.run_id }}-${{ github.run_attempt }}/
         retention-days: 30
         if-no-files-found: error
