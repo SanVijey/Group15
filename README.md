@@ -91,6 +91,12 @@ runs monthly and all workflows upload Bronze, Silver, Gold, rejected records,
 and quality evidence as run artifacts. Configure the self-hosted runner with
 Spark, Java, PySpark, and `HM_DATASET_DIR` before enabling scheduled execution.
 
+The `dev` workflow intentionally processes 100,000 rows per source by default
+so it fits the small self-hosted VM. Set the repository/environment variable
+`HM_DEV_LIMIT_ROWS` to change the development sample size. Full-dataset runs
+should use the production workflow on a larger or cluster-backed Spark
+resource.
+
 ### GitHub Actions setup
 
 These workflows use a **self-hosted** GitHub Actions runner because the dataset

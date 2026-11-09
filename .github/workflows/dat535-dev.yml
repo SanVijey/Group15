@@ -21,6 +21,7 @@ jobs:
       SPARK_DRIVER_MEMORY: ${{ vars.SPARK_DRIVER_MEMORY || '3g' }}
       SPARK_EXECUTOR_MEMORY: ${{ vars.SPARK_EXECUTOR_MEMORY || '3g' }}
       SPARK_SHUFFLE_PARTITIONS: ${{ vars.SPARK_SHUFFLE_PARTITIONS || '200' }}
+      HM_DEV_LIMIT_ROWS: ${{ vars.HM_DEV_LIMIT_ROWS || '100000' }}
 
     steps:
       - name: Checkout code
@@ -46,6 +47,7 @@ jobs:
             --input-dir "$HM_DATASET_DIR" \
             --output-dir "$DAT535_OUTPUT_DIR" \
             --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --limit-rows "$HM_DEV_LIMIT_ROWS" \
             --master "$SPARK_MASTER_URL"
 
       - name: Upload Dev artifacts
