@@ -96,7 +96,8 @@ The transformation design is:
 
 Quality evidence will be generated for every run. It will compare Bronze input
 with accepted and rejected records and record the number of exact duplicates
-removed (zero under the preserve-purchases policy). Required checks include schema availability, accepted-row counts,
+removed (zero under the preserve-purchases policy), including a per-reason
+breakdown of rejected transactions. Required checks include schema availability, accepted-row counts,
 rejected-row counts, duplicate counts, non-null key fields, positive prices,
 valid dates, and valid sales channels. Silver outputs should be published only
 after these transformations and checks complete successfully.

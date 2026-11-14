@@ -437,11 +437,16 @@ class HMMedallionPipeline:
             F.sum(F.when(~F.col("customer_matched"), 1).otherwise(0)).alias("unmatched_customers"),
         ).first()
         silver_count = summary["count"]
-        rejected_count = rejected.count()
+        rejected_by_reason = {
+            row["rejection_reason"]: row["count"]
+            for row in rejected.groupBy("rejection_reason").count().collect()
+        }
+        rejected_count = sum(rejected_by_reason.values())
         metrics = {
             "batch_id": self.batch_id,
             "bronze_transactions": quality_counts["bronze_transactions"],
             "rejected_transactions": quality_counts["rejected_transactions"] or 0,
+            "rejected_by_reason": rejected_by_reason,
             "accepted_transactions": silver_count,
             "silver_transactions": silver_count,
             "duplicate_transactions_removed": 0,

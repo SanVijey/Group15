@@ -94,6 +94,13 @@ class PipelineTests(unittest.TestCase):
         metrics = json.loads((output / "quality/regression.json").read_text())
         self.assertEqual(metrics["bronze_transactions"], 14)
         self.assertEqual(metrics["rejected_transactions"], 8)
+        self.assertEqual(metrics["rejected_by_reason"], {
+            "invalid_date": 1,
+            "missing_customer_id": 1,
+            "invalid_article_id": 1,
+            "invalid_price": 2,
+            "invalid_sales_channel_id": 3,
+        })
         self.assertEqual(metrics["duplicate_transactions_removed"], 0)
         self.assertTrue(metrics["quality_passed"])
         rejected = self.spark.read.parquet(str(output / "silver/rejected_transactions"))
