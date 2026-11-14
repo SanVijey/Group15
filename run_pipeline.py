@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 from hm_medallion_pipeline import HMMedallionPipeline
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pipeline", nargs="?", default="hm", choices=("hm",))
     parser.add_argument("--input-dir", default=None)

@@ -7,6 +7,10 @@ on:
     branches: [dev]
   workflow_dispatch:
 
+concurrency:
+  group: group15-spark-runner
+  cancel-in-progress: false
+
 jobs:
   run-dev:
     name: Run Dev Pipeline
@@ -33,9 +37,17 @@ jobs:
 
       - name: Validate pipeline source
         run: |
+          source ~/spark-env/bin/activate
           test -d "$HM_DATASET_DIR" || { echo "::error::Dataset directory does not exist: $HM_DATASET_DIR"; exit 1; }
           test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
           python -m py_compile hm_medallion_pipeline.py run_pipeline.py
+
+      - name: Run synthetic regression tests
+        run: |
+          source ~/spark-env/bin/activate
+          SPARK_DRIVER_MEMORY=512m SPARK_EXECUTOR_MEMORY=512m SPARK_SHUFFLE_PARTITIONS=2 \
+            PYSPARK_SUBMIT_ARGS='--driver-memory 512m pyspark-shell' \
+            python -m unittest discover -s tests -v
 
       - name: Run H&M medallion pipeline
         env:
@@ -49,6 +61,15 @@ jobs:
             --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --limit-rows "$HM_DEV_LIMIT_ROWS" \
             --master "$SPARK_MASTER_URL"
+          test -f "$DAT535_OUTPUT_DIR/_READY.json"
+
+      - name: Upload quality diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-quality-${{ github.run_number }}
+          path: ${{ steps.output-dir.outputs.dir }}/quality/
+          if-no-files-found: warn
 
       - name: Upload Dev artifacts
         uses: actions/upload-artifact@v4

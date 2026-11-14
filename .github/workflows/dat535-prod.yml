@@ -12,6 +12,10 @@ on:
         type: choice
         options: [hm]
 
+concurrency:
+  group: group15-spark-runner
+  cancel-in-progress: false
+
 jobs:
   deploy-prod:
     name: Deploy to Production
@@ -44,11 +48,23 @@ jobs:
           test -f "$HM_DATASET_DIR/transactions_train.parquet" -o -f "$HM_DATASET_DIR/transactions_train.csv" || { echo "::error::transactions_train source is missing"; exit 1; }
           mkdir -p "$DAT535_OUTPUT_DIR"
           python -m py_compile hm_medallion_pipeline.py run_pipeline.py
+          SPARK_DRIVER_MEMORY=512m SPARK_EXECUTOR_MEMORY=512m SPARK_SHUFFLE_PARTITIONS=2 \
+            PYSPARK_SUBMIT_ARGS='--driver-memory 512m pyspark-shell' \
+            python -m unittest discover -s tests -v
           python "$GITHUB_WORKSPACE/run_pipeline.py" hm \
             --input-dir "$HM_DATASET_DIR" \
             --output-dir "$DAT535_OUTPUT_DIR" \
             --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --master "$SPARK_MASTER_URL"
+          test -f "$DAT535_OUTPUT_DIR/_READY.json"
+
+      - name: Upload quality diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-quality-${{ github.run_number }}
+          path: ${{ steps.output-dir.outputs.dir }}/quality/
+          if-no-files-found: warn
 
       - name: Upload Production artifacts
         uses: actions/upload-artifact@v4

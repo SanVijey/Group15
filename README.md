@@ -23,15 +23,36 @@ is external and may contain missing values, invalid identifiers, duplicates, or
 schema changes. Download it separately according to its licence; source data
 and credentials are intentionally not committed to this repository.
 
+The original source is the [H&M Personalized Fashion Recommendations
+competition](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations/data).
+Follow Kaggle's access rules and competition terms; this project does not grant
+redistribution rights. The current VM contains pre-converted Parquet files.
+Their original conversion procedure/version has not yet been recorded; preserve
+that provenance before claiming exact reproduction of the original CSV dataset.
+Per-run archives/checksums reproduce the inputs supplied to this pipeline, not
+an undocumented prior conversion.
+
 ## Medallion layers
 
 ### Bronze: preserve and trace
 
 Each source is read as strings and written to Parquet without business
 transformation. Every row receives `source_file`, `ingestion_timestamp`, and
-`batch_id`. Bronze is organized by dataset and a stable batch marker makes a
-rerun with the same batch ID idempotent. A new batch appends data, preserving
-history for replay and audit.
+`batch_id`, plus a content SHA-256 `source_fingerprint`. Original files are
+archived unchanged under `raw/<dataset>/<sha256>/`. Bronze is organized by
+dataset and content version. Writes are staged outside Bronze and renamed
+into place only after Spark finishes, so interrupted writes are not read on
+retry. Already committed contents are skipped even when the batch ID changes.
+CSV headers and Parquet columns must match the declared contract; schema
+changes fail explicitly and require a reviewed schema update.
+
+This commit protocol supports a local/shared POSIX filesystem, not object-store
+URIs. Runs against the same output root take an exclusive lock. Different sample
+limits and full datasets cannot share a root. Legacy output layouts require a
+fresh root; no old data is deleted or migrated automatically. Changed transaction
+snapshots also require a fresh root to prevent overlapping historical purchases
+being counted twice. Incremental late-arrival ingestion is not implemented.
+Allow disk capacity for the original-file archive as well as processed outputs.
 
 ### Silver: validate, standardize, and enrich
 
@@ -41,15 +62,21 @@ price, and sales channel). The pipeline:
 - casts dates, identifiers, and prices to explicit types;
 - rejects records with invalid dates or IDs, non-positive prices, or unsupported
   sales channels to `silver/rejected_transactions`;
-- removes exact duplicate transactions;
-- deduplicates article and customer reference records before left joins;
+- preserves identical transaction observations: without a unique purchase ID,
+  identical rows can represent genuine repeat purchases;
+- removes exact reference duplicates, rejects conflicting values within a
+  reference version, and selects the latest ingested version per key;
 - fills missing descriptive attributes with `UNKNOWN` and derives `age_group`;
-- partitions the reusable `master_transactions` output by transaction date.
+- partitions the reusable `master_transactions` output by transaction date;
+- retains transaction lineage, adds calendar fields and reference-match flags,
+  and treats blank text and invalid/out-of-range ages as unknown.
 
 Each run writes JSON quality evidence under `quality/<batch_id>.json`, including
-Bronze, rejected, accepted, Silver, and duplicate-removal counts. This makes
-data-quality improvement and rejected-record handling visible rather than
-silently coercing bad data.
+Bronze, rejected, accepted, Silver, unmatched-reference, invalid-Silver, and
+duplicate-removal counts. Duplicate removal is now zero by policy. Non-empty
+Silver, valid required fields and exact input/accepted/rejected accounting are
+enforced before Gold. Missing reference matches are flagged and counted, not
+rejected, so accepted transactions are retained.
 
 ### Gold: serve a defined outcome
 
@@ -59,11 +86,22 @@ Gold outputs support retail demand and merchandising analysis:
   price;
 - `customer_segment_preferences`: top product and colour preferences by age
   group;
-- `inventory_velocity`: sales-day, recency, and dead-stock measures by article;
+- `inventory_velocity`: sales-day, recency, actual final-30-day purchase counts
+  and no-recent-sales indicators by article, including never-sold articles;
 - `recommendation_features`: customer/article interaction and spend features.
 
-Gold is smaller and purpose-specific while Silver remains reusable. Aggregates
-are published only after the Silver build and quality metrics complete.
+Gold is purpose-specific while Silver remains reusable; the interaction-feature
+table is not necessarily small. Daily, recommendation and inventory counts are
+reconciled to Silver, and daily/recommendation spend totals must match exactly.
+The final 30-day window includes the dataset maximum date and the preceding
+29 days, not the current calendar date. "Deadstock" is a no-observed-recent-sales
+proxy, not evidence of stock on hand. Source price units must not be presented as
+currency revenue without verifying the source's normalization.
+
+Consumers must require `_READY.json`, written atomically only after every Gold
+write and reconciliation succeeds. It is revoked at the start of a rerun.
+Individual Parquet tables are not an atomic multi-table transaction. Prefer
+immutable per-run roots (as in Actions), and consume only completed runs.
 
 ## Run locally
 
@@ -80,7 +118,8 @@ For a bounded development run:
 python run_pipeline.py hm --limit-rows 1000 --output-dir /tmp/hm-smoke
 ```
 
-Use `--batch-id` when a run must be reproducible or safely retried. Outputs
+Use `--batch-id` to label lineage and quality reports. Retry safety is based on
+committed source contents, not the label alone. Outputs
 default to `DAT535_OUTPUT_DIR` or `~/spark-lab-data/hm`.
 
 ## Delivery and operations
@@ -123,7 +162,24 @@ monthly on the first day of the month. Open the completed run to download the
 Parquet layers and the JSON quality evidence as artifacts.
 
 Changes should be tested with `python -m py_compile hm_medallion_pipeline.py
-run_pipeline.py` and a bounded local run before deployment. Logs include row
+run_pipeline.py` and the synthetic regression suite before deployment:
+
+```bash
+source ~/spark-env/bin/activate
+SPARK_DRIVER_MEMORY=512m SPARK_EXECUTOR_MEMORY=512m SPARK_SHUFFLE_PARTITIONS=2 \
+  PYSPARK_SUBMIT_ARGS='--driver-memory 512m pyspark-shell' \
+  python -m unittest discover -s tests -v
+```
+
+The tests use temporary synthetic CSV/Parquet inputs, not the H&M dataset.
+All workflows run this suite before processing data and share a concurrency
+group to avoid overlapping Actions jobs on the small runner. Dev and production
+upload available quality reports even on failure. This does not serialize
+manually started jobs against different output directories.
+
+Run a bounded real-data batch in a fresh directory after VM cleanup. Full-scale
+production validation and measured performance tuning remain outstanding.
+Logs include row
 counts and quality metrics; failed input discovery, Spark failures, or quality
 processing failures fail the workflow instead of producing success-shaped
 output.
