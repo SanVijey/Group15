@@ -130,6 +130,22 @@ class PipelineTests(unittest.TestCase):
                 self.pipeline.run()
         self.assertFalse((output / "_READY.json").exists())
 
+    def test_stages_run_independently(self):
+        output = self.pipeline.output_dir
+        with patch.object(self.pipeline, "create_spark_session", return_value=self.spark), patch.object(self.spark, "stop"):
+            with self.assertRaisesRegex(FileNotFoundError, "run the silver stage first"):
+                self.pipeline.run(stages=("gold",))
+            self.pipeline.run(stages=("bronze",))
+            self.assertFalse((output / "_READY.json").exists())
+            with self.assertRaisesRegex(ValueError, "Unknown pipeline stages"):
+                self.pipeline.run(stages=("platinum",))
+            self.pipeline.run(stages=("silver",))
+            self.assertFalse((output / "_READY.json").exists())
+            self.pipeline.run(stages=("gold",))
+        self.assertTrue((output / "_READY.json").exists())
+        daily = self.spark.read.parquet(str(output / "gold/daily_sales_demand"))
+        self.assertEqual(sum(row.transaction_count for row in daily.collect()), 6)
+
     def test_ingestion_retries_and_sample_isolation(self):
         self.pipeline.ingest_bronze()
         self.pipeline.batch_id = "retry"

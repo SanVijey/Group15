@@ -122,6 +122,28 @@ Use `--batch-id` to label lineage and quality reports. Retry safety is based on
 committed source contents, not the label alone. Outputs
 default to `DAT535_OUTPUT_DIR` or `~/spark-lab-data/hm`.
 
+### Running layers independently
+
+The pipeline code is split per layer: `hm_bronze.py`, `hm_silver.py`, and
+`hm_gold.py` contain the layer implementations (sharing configuration and
+helpers from `hm_common.py`), and `hm_medallion_pipeline.py` orchestrates
+them. Each layer module is directly runnable; the layers communicate through
+the persisted Parquet in the shared `--output-dir`, so the stages chain
+without re-reading the source dataset:
+
+```bash
+python hm_bronze.py --output-dir /tmp/hm-staged   # reads HM_DATASET_DIR once
+python hm_silver.py --output-dir /tmp/hm-staged   # reads bronze/ only
+python hm_gold.py --output-dir /tmp/hm-staged     # reads silver/ and bronze/articles
+```
+
+Bronze skips unchanged source files (same SHA-256 content), so repeated runs do
+not re-ingest the dataset. Silver and Gold never read the dataset directory at
+all. Running a stage out of order fails with an explicit message naming the
+missing upstream layer. Rerunning any stage revokes `_READY.json`; it is
+rewritten only after the gold stage completes and reconciles against Silver.
+`run_pipeline.py hm` still runs all three stages in sequence.
+
 ## Delivery and operations
 
 The development workflow validates Python source and runs the pipeline on
@@ -161,8 +183,9 @@ also be started manually from **Actions > Pipeline > Run workflow** and runs
 monthly on the first day of the month. Open the completed run to download the
 Parquet layers and the JSON quality evidence as artifacts.
 
-Changes should be tested with `python -m py_compile hm_medallion_pipeline.py
-run_pipeline.py` and the synthetic regression suite before deployment:
+Changes should be tested with `python -m py_compile hm_common.py hm_bronze.py
+hm_silver.py hm_gold.py hm_medallion_pipeline.py run_pipeline.py` and the
+synthetic regression suite before deployment:
 
 ```bash
 source ~/spark-env/bin/activate
