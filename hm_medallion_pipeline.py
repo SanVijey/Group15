@@ -18,7 +18,7 @@ import hashlib
 import shutil
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -133,11 +133,22 @@ class HMMedallionPipeline:
         batch_id: Optional[str] = None,
         limit_rows: Optional[int] = None,
         master: Optional[str] = None,
+        window_days: int = 30,
+        as_of_date: Optional[str] = None,
     ) -> None:
         self.input_dir = Path(input_dir).expanduser()
         self.output_dir = Path(output_dir).expanduser()
         self.batch_id = batch_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.limit_rows = limit_rows
+        self.window_days = window_days
+        if window_days <= 0:
+            raise ValueError("window_days must be positive")
+        self.as_of_date = None
+        if as_of_date is not None:
+            try:
+                self.as_of_date = date.fromisoformat(as_of_date)
+            except ValueError as exc:
+                raise ValueError("as_of_date must use YYYY-MM-DD") from exc
         if limit_rows is not None and limit_rows <= 0:
             raise ValueError("limit_rows must be positive")
         if not self.batch_id or Path(self.batch_id).name != self.batch_id or self.batch_id in (".", ".."):
@@ -487,12 +498,35 @@ class HMMedallionPipeline:
             .filter(F.col("preference_rank") <= 10)
         )
 
-        max_date = silver.agg(F.max("transaction_date").alias("max_date")).first()["max_date"]
-        if max_date is None:
+        dataset_max_date = silver.agg(
+            F.max("transaction_date").alias("max_date")
+        ).first()["max_date"]
+        if dataset_max_date is None:
             raise ValueError("Cannot publish Gold from empty Silver")
-        recent = F.col("transaction_date").between(
-            F.date_sub(F.lit(max_date), 29), F.lit(max_date)
+        window_end = (
+            self.as_of_date
+            if self.as_of_date is not None
+            else dataset_max_date
         )
+        window_start = window_end - timedelta(days=self.window_days - 1)
+        recent = F.col("transaction_date").between(
+            F.lit(window_start).cast("date"),
+            F.lit(window_end).cast("date"),
+        )
+        observed_dates = {
+            row.transaction_date
+            for row in silver.filter(recent)
+            .select("transaction_date")
+            .distinct()
+            .collect()
+        }
+        missing_window_dates = []
+        cursor = window_start
+        while cursor <= window_end:
+            if cursor not in observed_dates:
+                missing_window_dates.append(cursor.isoformat())
+            cursor += timedelta(days=1)
+        complete_window = len(missing_window_dates) == 0
         inventory_metrics = (
             silver.groupBy("article_id")
             .agg(
@@ -515,14 +549,29 @@ class HMMedallionPipeline:
             .withColumn("total_units_sold", F.coalesce(F.col("total_units_sold"), F.lit(0)))
             .withColumn("unique_customers", F.coalesce(F.col("unique_customers"), F.lit(0)))
             .withColumn("sales_days", F.coalesce(F.col("sales_days"), F.lit(0)))
-            .withColumn("dataset_max_date", F.lit(max_date).cast("date"))
+            .withColumn("dataset_max_date", F.lit(dataset_max_date).cast("date"))
+            .withColumn("window_start", F.lit(window_start).cast("date"))
+            .withColumn("window_end", F.lit(window_end).cast("date"))
+            .withColumn("window_days", F.lit(self.window_days))
+            .withColumn("window_missing_dates", F.lit(len(missing_window_dates)))
+            .withColumn("window_complete", F.lit(complete_window))
             .withColumn(
                 "recent_units_30d",
                 F.coalesce(F.col("recent_units_30d"), F.lit(0)),
             )
             .withColumn(
                 "deadstock_last_30d",
-                F.col("recent_units_30d") == 0,
+                F.when(F.lit(complete_window), F.col("recent_units_30d") == 0),
+            )
+            .withColumn(
+                "deadstock_status",
+                F.when(
+                    ~F.lit(complete_window),
+                    F.lit("UNKNOWN_WINDOW_GAPS"),
+                ).when(
+                    F.col("recent_units_30d") == 0,
+                    F.lit("NO_SALES_IN_COMPLETE_WINDOW"),
+                ).otherwise(F.lit("SALES_IN_WINDOW")),
             )
         )
 
@@ -566,9 +615,85 @@ class HMMedallionPipeline:
             ).first()
             if actual["units"] != expected["units"] or (sales and actual["sales"] != expected["sales"]):
                 raise ValueError(f"Gold reconciliation failed for {name}: {actual} != {expected}")
+        quality_path = self.output_dir / "quality" / f"{self.batch_id}.json"
+        if quality_path.exists():
+            quality = json.loads(quality_path.read_text(encoding="utf-8"))
+            quality.update({
+                "gold_window_start": window_start.isoformat(),
+                "gold_window_end": window_end.isoformat(),
+                "gold_window_days": self.window_days,
+                "gold_window_missing_dates": missing_window_dates,
+                "gold_window_complete": complete_window,
+                "gold_window_reconciliation_passed": True,
+            })
+            self._write_quality(quality)
         return outputs
 
-    def run(self) -> Dict[str, DataFrame]:
+    def _write_layer_ready(self, name: str) -> None:
+        ready = self.output_dir / f"_{name.upper()}_READY.json"
+        temporary = ready.with_suffix(".partial")
+        temporary.write_text(json.dumps({
+            "batch_id": self.batch_id,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "layer": name,
+        }, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(ready)
+
+    def run_bronze(self) -> Dict[str, DataFrame]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "_run.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.create_spark_session()
+            try:
+                bronze = self.ingest_bronze()
+                self._write_layer_ready("bronze")
+                return bronze
+            finally:
+                assert self.spark is not None
+                self.spark.stop()
+
+    def run_silver(self) -> DataFrame:
+        if not (self.output_dir / "bronze").exists():
+            raise ValueError("Bronze does not exist; run --layer bronze first")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "_run.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.create_spark_session()
+            try:
+                silver = self.build_silver()
+                self._write_layer_ready("silver")
+                return silver
+            finally:
+                assert self.spark is not None
+                self.spark.stop()
+
+    def run_gold(self) -> Dict[str, DataFrame]:
+        if not (self.output_dir / "silver" / "master_transactions").exists():
+            raise ValueError("Silver does not exist; run --layer silver first")
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "_run.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.create_spark_session()
+            try:
+                silver = self.spark.read.parquet(
+                    self._silver_path("master_transactions")
+                )
+                gold = self.build_gold(silver)
+                self._write_layer_ready("gold")
+                return gold
+            finally:
+                assert self.spark is not None
+                self.spark.stop()
+
+    def run(self, layer: str = "all") -> object:
+        if layer == "bronze":
+            return self.run_bronze()
+        if layer == "silver":
+            return self.run_silver()
+        if layer == "gold":
+            return self.run_gold()
+        if layer != "all":
+            raise ValueError("layer must be one of: all, bronze, silver, gold")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         with (self.output_dir / "_run.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -615,6 +740,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-id", help="Stable identifier for this Bronze ingestion batch")
     parser.add_argument("--limit-rows", type=int, help="Limit each source for a small development run")
     parser.add_argument("--master", help="Optional Spark master, for example local[2] or spark://host:7077")
+    parser.add_argument(
+        "--layer",
+        choices=("all", "bronze", "silver", "gold"),
+        default="all",
+        help="Run the complete pipeline or only one medallion layer",
+    )
+    parser.add_argument("--window-days", type=int, default=30)
+    parser.add_argument("--as-of-date", help="Window end date in YYYY-MM-DD format")
     return parser.parse_args()
 
 
@@ -630,7 +763,9 @@ def main() -> None:
         batch_id=args.batch_id,
         limit_rows=args.limit_rows,
         master=args.master,
-    ).run()
+        window_days=args.window_days,
+        as_of_date=args.as_of_date,
+    ).run(args.layer)
 
 
 if __name__ == "__main__":

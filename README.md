@@ -103,6 +103,27 @@ write and reconciliation succeeds. It is revoked at the start of a rerun.
 Individual Parquet tables are not an atomic multi-table transaction. Prefer
 immutable per-run roots (as in Actions), and consume only completed runs.
 
+The 30-day inventory window is measured from the latest Silver transaction date
+unless `--as-of-date YYYY-MM-DD` is supplied. It contains exactly `--window-days`
+calendar dates (30 by default). Gold records observed and missing dates in the
+window. An article is marked as a deadstock proxy only when every date in the
+window has observed sales activity; if the window has gaps, deadstock is reported
+as unknown because missing transaction coverage cannot prove that no sales occurred.
+This is deliberately distinct from a complete window with no sales for an article.
+
+The H&M layers can also be executed independently:
+
+```bash
+python run_pipeline.py hm --layer bronze --output-dir /tmp/hm
+python run_pipeline.py hm --layer silver --output-dir /tmp/hm
+python run_pipeline.py hm --layer gold --output-dir /tmp/hm
+python run_pipeline.py hm --layer all --output-dir /tmp/hm
+```
+
+Independent runs require the previous layer to exist. Bronze creates
+`_BRONZE_READY.json`, Silver creates `_SILVER_READY.json`, and Gold creates
+`_GOLD_READY.json`.
+
 ## Run locally
 
 ```bash
@@ -147,6 +168,11 @@ is local to the Spark machine. On the machine that has the dataset and Spark:
    `~/spark-env/bin/python` can import `pyspark`.
 3. Put the source files in the runner's configured dataset directory:
    `/home/ubuntu/HMDataSet` by default.
+   GitHub Actions does **not** download or unzip the Kaggle dataset on each run:
+   the data is already local to the self-hosted runner. This avoids network
+   transfer and repeated download costs. Preload and periodically verify the
+   source files on the runner, rather than storing them in GitHub Actions
+   artifacts or downloading them from Kaggle for every workflow execution.
 4. If using a Spark standalone cluster, start the master and worker and create
    a repository variable named `SPARK_MASTER_URL`, for example
    `spark://spark-host:7077`. Without that variable, the workflow uses

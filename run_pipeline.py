@@ -22,6 +22,14 @@ def main() -> None:
     parser.add_argument("--batch-id", default=None)
     parser.add_argument("--limit-rows", type=int, default=None)
     parser.add_argument("--master", default=None)
+    parser.add_argument(
+        "--layer",
+        choices=("all", "bronze", "silver", "gold"),
+        default="all",
+        help="Run the complete pipeline or only one medallion layer",
+    )
+    parser.add_argument("--window-days", type=int, default=30)
+    parser.add_argument("--as-of-date", default=None)
     args = parser.parse_args()
 
     HMMedallionPipeline(
@@ -32,7 +40,9 @@ def main() -> None:
         batch_id=args.batch_id,
         limit_rows=args.limit_rows,
         master=args.master,
-    ).run()
+        window_days=args.window_days,
+        as_of_date=args.as_of_date,
+    ).run(args.layer)
 
 
 if __name__ == "__main__":

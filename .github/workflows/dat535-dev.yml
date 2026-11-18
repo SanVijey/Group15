@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      layer:
+        description: Pipeline layer to run
+        required: true
+        default: all
+        type: choice
+        options: [all, bronze, silver, gold]
 
 concurrency:
   group: group15-spark-runner
@@ -60,6 +67,7 @@ jobs:
             --output-dir "$DAT535_OUTPUT_DIR" \
             --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --limit-rows "$HM_DEV_LIMIT_ROWS" \
+            --layer "${{ inputs.layer || 'all' }}" \
             --master "$SPARK_MASTER_URL"
           test -f "$DAT535_OUTPUT_DIR/_READY.json"
 

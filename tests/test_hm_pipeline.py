@@ -110,8 +110,11 @@ class PipelineTests(unittest.TestCase):
         }
         self.assertEqual(inventory[1].total_units_sold, 4)
         self.assertEqual(inventory[1].recent_units_30d, 2)  # Jan 2 included; Jan 1 excluded.
-        self.assertTrue(inventory[2].deadstock_last_30d)  # Never sold.
-        self.assertTrue(inventory[3].deadstock_last_30d)  # Sold only before window.
+        self.assertFalse(inventory[1].window_complete)
+        self.assertIsNone(inventory[2].deadstock_last_30d)
+        self.assertEqual(inventory[2].deadstock_status, "UNKNOWN_WINDOW_GAPS")
+        self.assertIsNone(inventory[3].deadstock_last_30d)
+        self.assertEqual(inventory[3].deadstock_status, "UNKNOWN_WINDOW_GAPS")
         self.assertEqual(inventory[99].total_units_sold, 1)  # Unmatched article retained.
         daily = self.spark.read.parquet(str(output / "gold/daily_sales_demand"))
         self.assertEqual(sum(row.transaction_count for row in daily.collect()), 6)
@@ -185,6 +188,35 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "quality gate failed"):
             self.pipeline.build_silver()
         self.assertFalse((self.pipeline.output_dir / "_READY.json").exists())
+
+    def test_complete_window_marks_deadstock_and_excludes_future_data(self):
+        rows = [
+            [f"2020-01-{day:02d}", "c1", "1", "1", "1"]
+            for day in range(1, 32)
+        ]
+        self.write_transactions(rows)
+        self.pipeline.ingest_bronze()
+        silver = self.pipeline.build_silver()
+        gold_pipeline = HMMedallionPipeline(
+            str(self.source),
+            str(self.root / "output"),
+            batch_id="regression",
+            master="local[1]",
+            window_days=30,
+            as_of_date="2020-01-31",
+        )
+        gold_pipeline.spark = self.spark
+        gold_pipeline.build_gold(silver)
+        inventory = {
+            row.article_id: row
+            for row in self.spark.read.parquet(
+                str(self.root / "output/gold/inventory_velocity")
+            ).collect()
+        }
+        self.assertTrue(inventory[1].window_complete)
+        self.assertEqual(inventory[1].recent_units_30d, 30)
+        self.assertTrue(inventory[2].deadstock_last_30d)
+        self.assertEqual(inventory[2].deadstock_status, "NO_SALES_IN_COMPLETE_WINDOW")
 
     def test_conflicting_reference_fails(self):
         self.write("customers", CUSTOMER_COLUMNS, [

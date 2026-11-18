@@ -11,6 +11,12 @@ on:
         default: hm
         type: choice
         options: [hm]
+      layer:
+        description: Pipeline layer to run
+        required: true
+        default: all
+        type: choice
+        options: [all, bronze, silver, gold]
 
 concurrency:
   group: group15-spark-runner
@@ -55,6 +61,7 @@ jobs:
             --input-dir "$HM_DATASET_DIR" \
             --output-dir "$DAT535_OUTPUT_DIR" \
             --batch-id "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --layer "${{ inputs.layer || 'all' }}" \
             --master "$SPARK_MASTER_URL"
           test -f "$DAT535_OUTPUT_DIR/_READY.json"
 
