@@ -67,6 +67,8 @@ price, and sales channel). The pipeline:
 - removes exact reference duplicates, rejects conflicting values within a
   reference version, and selects the latest ingested version per key;
 - fills missing descriptive attributes with `UNKNOWN` and derives `age_group`;
+- derives `transaction_year`, `transaction_month`, and a northern-hemisphere
+  season (`SPRING`, `SUMMER`, `AUTUMN`, `WINTER`);
 - partitions the reusable `master_transactions` output by transaction date;
 - retains transaction lineage, adds calendar fields and reference-match flags,
   and treats blank text and invalid/out-of-range ages as unknown.
@@ -83,11 +85,18 @@ rejected, so accepted transactions are retained.
 Gold outputs support retail demand and merchandising analysis:
 
 - `daily_sales_demand`: daily transaction count, customers, sales, and average
-  price;
+  price, split by sales channel;
 - `customer_segment_preferences`: top product and colour preferences by age
-  group;
+  group and club-member status;
 - `inventory_velocity`: sales-day, recency, actual final-30-day purchase counts
   and no-recent-sales indicators by article, including never-sold articles;
+- `product_demand_velocity`: observed-demand and recency metrics with
+  `no_recent_sales_30d`, clearly distinguished from physical stock or
+  actual deadstock;
+- `seasonal_trend_performance`: transaction volume and distinct customers/articles
+  by year, season, garment group, and colour;
+- `customer_engagement`: purchase count, active sales days, distinct articles,
+  spend, and first/last purchase date by customer and demographic segment;
 - `recommendation_features`: customer/article interaction and spend features.
 
 Gold is purpose-specific while Silver remains reusable; the interaction-feature

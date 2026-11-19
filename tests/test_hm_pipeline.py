@@ -45,9 +45,9 @@ class PipelineTests(unittest.TestCase):
             {"article_id": "3"},
         ])
         self.write("customers", CUSTOMER_COLUMNS, [
-            {"customer_id": "c1", "age": "25", "club_member_status": " "},
-            {"customer_id": "c2", "age": "NaN"},
-            {"customer_id": "c3", "age": "999"},
+            {"customer_id": "c1", "age": "25", "club_member_status": " ACTIVE "},
+            {"customer_id": "c2", "age": "NaN", "club_member_status": "PRE-CREATE"},
+            {"customer_id": "c3", "age": "999", "club_member_status": "ACTIVE"},
         ])
         self.valid = [
             ["2020-01-01", "c1", "1", "1.5", "1"],
@@ -89,8 +89,16 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(silver.filter("NOT customer_matched").count(), 1)
         self.assertEqual(silver.filter("NOT article_matched").count(), 1)
         self.assertEqual(silver.filter("customer_id IN ('c2', 'c3') AND age_group = 'UNKNOWN'").count(), 2)
-        self.assertEqual(silver.filter("customer_id = 'c1' AND club_member_status = 'UNKNOWN'").count(), 3)
-        self.assertTrue({"batch_id", "source_file", "ingestion_timestamp", "transaction_year"} <= set(silver.columns))
+        self.assertEqual(silver.filter("customer_id = 'c1' AND club_member_status = 'ACTIVE'").count(), 3)
+        self.assertTrue({
+            "batch_id",
+            "source_file",
+            "ingestion_timestamp",
+            "transaction_year",
+            "transaction_month",
+            "season",
+        } <= set(silver.columns))
+        self.assertEqual(silver.filter("season != 'WINTER'").count(), 0)
         metrics = json.loads((output / "quality/regression.json").read_text())
         self.assertEqual(metrics["bronze_transactions"], 14)
         self.assertEqual(metrics["rejected_transactions"], 8)
@@ -115,10 +123,29 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(inventory[99].total_units_sold, 1)  # Unmatched article retained.
         daily = self.spark.read.parquet(str(output / "gold/daily_sales_demand"))
         self.assertEqual(sum(row.transaction_count for row in daily.collect()), 6)
+        self.assertTrue("sales_channel_id" in daily.columns)
+        engagement = self.spark.read.parquet(str(output / "gold/customer_engagement"))
+        c1 = engagement.filter("customer_id = 'c1'").first()
+        self.assertEqual(c1.purchase_count, 3)
+        self.assertEqual(c1.distinct_articles, 2)
+        self.assertEqual(c1.age_group, "20_29")
         preferences = self.spark.read.parquet(str(output / "gold/customer_segment_preferences"))
-        top = preferences.filter("age_group = '20_29' AND preference_rank = 1").first()
+        top = preferences.filter(
+            "age_group = '20_29' AND club_member_status = 'ACTIVE' AND preference_rank = 1"
+        ).first()
         self.assertEqual(top.garment_group_name, "Tops")
         self.assertEqual(top.total_units, 2)
+        seasonal = self.spark.read.parquet(str(output / "gold/seasonal_trend_performance"))
+        self.assertEqual(seasonal.filter("season = 'WINTER'").first().transaction_year, 2020)
+        demand = self.spark.read.parquet(str(output / "gold/product_demand_velocity"))
+        demand_1 = demand.filter("article_id = 1").first()
+        self.assertEqual(demand_1.recent_units_30d, 2)
+        self.assertFalse(demand_1.no_recent_sales_30d)
+        demand_2 = demand.filter("article_id = 2").first()
+        self.assertTrue(demand_2.in_article_catalogue)
+        self.assertEqual(demand_2.total_units_sold, 0)
+        demand_99 = demand.filter("article_id = 99").first()
+        self.assertFalse(demand_99.in_article_catalogue)
         self.assertTrue((output / "_READY.json").exists())
         for name in ("transactions", "articles", "customers"):
             original = self.source / ("transactions_train.csv" if name == "transactions" else f"{name}.csv")
@@ -129,6 +156,26 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "injected failure"):
                 self.pipeline.run()
         self.assertFalse((output / "_READY.json").exists())
+
+    def test_season_derivation_covers_all_month_boundaries(self):
+        self.write_transactions([
+            ["2020-12-31", "c1", "1", "1.0", "1"],
+            ["2020-03-31", "c1", "1", "1.0", "1"],
+            ["2020-06-30", "c1", "1", "1.0", "1"],
+            ["2020-09-30", "c1", "1", "1.0", "1"],
+        ])
+        self.pipeline.ingest_bronze()
+        silver = self.pipeline.build_silver()
+        seasons = {
+            row.transaction_month: row.season
+            for row in silver.select("transaction_month", "season").distinct().collect()
+        }
+        self.assertEqual(seasons, {
+            3: "SPRING",
+            6: "SUMMER",
+            9: "AUTUMN",
+            12: "WINTER",
+        })
 
     def test_stages_run_independently(self):
         output = self.pipeline.output_dir

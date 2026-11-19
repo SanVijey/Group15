@@ -31,11 +31,16 @@ class GoldLayer:
         context = self.context
         spark = context.require_spark()
 
-        segment_window = Window.partitionBy("age_group").orderBy(
+        segment_window = Window.partitionBy("age_group", "club_member_status").orderBy(
             F.desc("total_units"), F.asc("garment_group_name"), F.asc("colour_group_name")
         )
         segment = (
-            silver.groupBy("age_group", "garment_group_name", "colour_group_name")
+            silver.groupBy(
+                "age_group",
+                "club_member_status",
+                "garment_group_name",
+                "colour_group_name",
+            )
             .agg(
                 F.sum(F.lit(1)).alias("total_units"),
                 F.countDistinct("customer_id").alias("unique_customers"),
@@ -61,16 +66,23 @@ class GoldLayer:
                 F.sum(F.when(recent, 1).otherwise(0)).alias("recent_units_30d"),
             )
         )
-        all_articles = spark.read.option("mergeSchema", "true").parquet(
+        article_catalogue = spark.read.option("mergeSchema", "true").parquet(
             context._bronze_path("articles")
         ).select(
             F.col("article_id").cast("long").alias("article_id")
-        ).filter("article_id IS NOT NULL AND article_id > 0").union(
+        ).filter("article_id IS NOT NULL AND article_id > 0").distinct()
+        all_articles = article_catalogue.union(
             silver.select("article_id").distinct()
         ).distinct()
         inventory = (
-            all_articles.join(inventory_metrics, "article_id", "left")
+            all_articles.join(
+                article_catalogue.withColumn("in_article_catalogue", F.lit(True)),
+                "article_id",
+                "left",
+            )
+            .join(inventory_metrics, "article_id", "left")
             .withColumn("total_units_sold", F.coalesce(F.col("total_units_sold"), F.lit(0)))
+            .withColumn("in_article_catalogue", F.coalesce(F.col("in_article_catalogue"), F.lit(False)))
             .withColumn("unique_customers", F.coalesce(F.col("unique_customers"), F.lit(0)))
             .withColumn("sales_days", F.coalesce(F.col("sales_days"), F.lit(0)))
             .withColumn("dataset_max_date", F.lit(max_date).cast("date"))
@@ -81,6 +93,56 @@ class GoldLayer:
             .withColumn(
                 "deadstock_last_30d",
                 F.col("recent_units_30d") == 0,
+            )
+            .withColumn(
+                "no_recent_sales_30d",
+                F.col("recent_units_30d") == 0,
+            )
+            .withColumn(
+                "days_since_last_sale",
+                F.when(
+                    F.col("last_sale_date").isNotNull(),
+                    F.datediff(F.lit(max_date), F.col("last_sale_date")),
+                ),
+            )
+        )
+
+        product_demand = inventory.select(
+            "article_id",
+            "total_units_sold",
+            "unique_customers",
+            "sales_days",
+            "last_sale_date",
+            "dataset_max_date",
+            "recent_units_30d",
+            "no_recent_sales_30d",
+            "days_since_last_sale",
+            "in_article_catalogue",
+        )
+
+        seasonal_trends = (
+            silver.groupBy(
+                "transaction_year",
+                "season",
+                "garment_group_name",
+                "colour_group_name",
+            )
+            .agg(
+                F.count("*").alias("transaction_count"),
+                F.countDistinct("customer_id").alias("unique_customers"),
+                F.countDistinct("article_id").alias("unique_articles"),
+            )
+        )
+
+        customer_engagement = (
+            silver.groupBy("customer_id", "age_group", "club_member_status")
+            .agg(
+                F.count("*").alias("purchase_count"),
+                F.countDistinct("transaction_date").alias("active_days"),
+                F.countDistinct("article_id").alias("distinct_articles"),
+                F.sum("price").alias("total_spend"),
+                F.min("transaction_date").alias("first_purchase_date"),
+                F.max("transaction_date").alias("last_purchase_date"),
             )
         )
 
@@ -100,8 +162,11 @@ class GoldLayer:
         outputs = {
             "customer_segment_preferences": segment,
             "inventory_velocity": inventory,
+            "product_demand_velocity": product_demand,
+            "seasonal_trend_performance": seasonal_trends,
+            "customer_engagement": customer_engagement,
             "recommendation_features": recommendations,
-            "daily_sales_demand": silver.groupBy("transaction_date").agg(
+            "daily_sales_demand": silver.groupBy("transaction_date", "sales_channel_id").agg(
                 F.count("*").alias("transaction_count"),
                 F.countDistinct("customer_id").alias("unique_customers"),
                 F.sum("price").alias("total_sales"),
@@ -116,6 +181,9 @@ class GoldLayer:
             ("daily_sales_demand", "transaction_count", "total_sales"),
             ("recommendation_features", "interaction_count", "total_spend"),
             ("inventory_velocity", "total_units_sold", None),
+            ("product_demand_velocity", "total_units_sold", None),
+            ("seasonal_trend_performance", "transaction_count", None),
+            ("customer_engagement", "purchase_count", "total_spend"),
         ):
             written = spark.read.parquet(context._gold_path(name))
             actual = written.agg(

@@ -138,6 +138,12 @@ class SilverLayer:
             F.col("clean_sales_channel_id").alias("sales_channel_id"),
         ).withColumn("transaction_year", F.year("transaction_date")).withColumn(
             "transaction_month", F.month("transaction_date")
+        ).withColumn(
+            "season",
+            F.when(F.col("transaction_month").isin(3, 4, 5), "SPRING")
+            .when(F.col("transaction_month").isin(6, 7, 8), "SUMMER")
+            .when(F.col("transaction_month").isin(9, 10, 11), "AUTUMN")
+            .otherwise("WINTER"),
         )
         articles = self.latest_reference("articles", "article_id", ARTICLE_COLUMNS).select(
             F.expr("try_cast(article_id AS BIGINT)").alias("article_id"),
